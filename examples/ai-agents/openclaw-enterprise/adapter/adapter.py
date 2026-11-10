@@ -19,6 +19,7 @@ AGW_CA_VOLUME = "agentgateway-ca"
 AGW_CA_CONFIG_MAP = "agentgateway-ca"
 AGW_CA_PATH = "/etc/openclaw/agentgateway/ca.crt"
 NODE_CA_ENV = "NODE_EXTRA_CA_CERTS"
+SERVICE_ACCOUNT_MOUNT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 LINK_SCRIPT = r"""
 const fs = require("node:fs");
@@ -107,6 +108,68 @@ def _runtime_environment(container: dict[str, Any], location: str) -> list[Any]:
     return environment
 
 
+def _default_service_account_volumes(
+    volumes: list[Any], mounts: list[Any]
+) -> set[str]:
+    """Find only Kubernetes' standard auto-injected service-account projections."""
+    removable: set[str] = set()
+    for volume in volumes:
+        if not isinstance(volume, dict):
+            continue
+        name = volume.get("name")
+        projected = volume.get("projected")
+        if not (
+            _is_nonempty_string(name)
+            and name.startswith("kube-api-access-")
+            and isinstance(projected, dict)
+            and isinstance(projected.get("sources"), list)
+        ):
+            continue
+
+        sources = projected["sources"]
+        has_default_token = any(
+            isinstance(source, dict)
+            and isinstance(source.get("serviceAccountToken"), dict)
+            and source["serviceAccountToken"].get("path") == "token"
+            for source in sources
+        )
+        has_root_ca = any(
+            isinstance(source, dict)
+            and isinstance(source.get("configMap"), dict)
+            and source["configMap"].get("name") == "kube-root-ca.crt"
+            for source in sources
+        )
+        has_namespace = any(
+            isinstance(source, dict)
+            and isinstance(source.get("downwardAPI"), dict)
+            and any(
+                isinstance(item, dict)
+                and item.get("path") == "namespace"
+                and isinstance(item.get("fieldRef"), dict)
+                and item["fieldRef"].get("fieldPath") == "metadata.namespace"
+                for item in source["downwardAPI"].get("items", [])
+            )
+            for source in sources
+        )
+        references = [
+            mount
+            for mount in mounts
+            if isinstance(mount, dict) and mount.get("name") == name
+        ]
+        if (
+            has_default_token
+            and has_root_ca
+            and has_namespace
+            and references
+            and all(
+                mount.get("mountPath") == SERVICE_ACCOUNT_MOUNT_PATH
+                for mount in references
+            )
+        ):
+            removable.add(name)
+    return removable
+
+
 def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
     """Return an RFC 6902 patch, or raise AdmissionError for unsafe target Pods."""
     if not isinstance(pod, dict):
@@ -143,6 +206,9 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
         for index, container in enumerate(group)
         for mount in _mounts(container, f"{group_name}[{index}]")
     ]
+    default_service_account_volumes = _default_service_account_volumes(
+        volumes, all_mounts
+    )
     if any(
         isinstance(volume, dict)
         and volume.get("name") == DEDICATED_WORKSPACE_VOLUME
@@ -231,13 +297,20 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
             mounts = _mounts(container, f"spec.{group_name}[{index}]")
             rewritten: list[dict[str, Any]] = []
             state_root_count = 0
-            affected = False
+            state_affected = False
+            mounts_changed = False
 
             for mount in mounts:
                 if not isinstance(mount, dict):
                     raise AdmissionError(
                         f"spec.{group_name}[{index}].volumeMounts entries must be objects"
                     )
+                if (
+                    mount.get("name") in default_service_account_volumes
+                    and mount.get("mountPath") == SERVICE_ACCOUNT_MOUNT_PATH
+                ):
+                    mounts_changed = True
+                    continue
                 if mount.get("name") != STATE_VOLUME:
                     if mount.get("mountPath") == STATE_ROOT:
                         raise AdmissionError(
@@ -281,13 +354,13 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                     raise AdmissionError(
                         f"conflicting gateway-state targets for {mount_path}"
                     )
-                affected = True
+                state_affected = True
 
             if state_root_count > 1:
                 raise AdmissionError(
                     f"spec.{group_name}[{index}] has duplicate {STATE_ROOT} mounts"
                 )
-            if affected:
+            if state_affected:
                 if state_root_count == 0:
                     rewritten.append(
                         {"name": STATE_VOLUME, "mountPath": STATE_ROOT}
@@ -329,6 +402,7 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                                 ],
                             }
                         )
+            if state_affected or mounts_changed:
                 mount_patches.append(
                     {
                         "op": "replace",
@@ -408,15 +482,25 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
     patch.extend(environment_patches)
     patch.append(
         {
-            "op": "add",
-            "path": "/spec/volumes/-",
-            "value": {
-                "name": AGW_CA_VOLUME,
-                "configMap": {
-                    "name": AGW_CA_CONFIG_MAP,
-                    "items": [{"key": "ca.crt", "path": "ca.crt"}],
+            "op": "replace",
+            "path": "/spec/volumes",
+            "value": [
+                *[
+                    copy.deepcopy(volume)
+                    for volume in volumes
+                    if not (
+                        isinstance(volume, dict)
+                        and volume.get("name") in default_service_account_volumes
+                    )
+                ],
+                {
+                    "name": AGW_CA_VOLUME,
+                    "configMap": {
+                        "name": AGW_CA_CONFIG_MAP,
+                        "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                    },
                 },
-            },
+            ],
         }
     )
     patch.append(

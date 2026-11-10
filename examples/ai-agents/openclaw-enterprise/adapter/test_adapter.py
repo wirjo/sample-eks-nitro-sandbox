@@ -93,6 +93,102 @@ def target_pod() -> dict:
     }
 
 
+def admitted_target_pod() -> dict:
+    pod = target_pod()
+    pod["spec"]["volumes"].extend(
+        [
+            {
+                "name": "kube-api-access-k82tq",
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [
+                        {
+                            "serviceAccountToken": {
+                                "expirationSeconds": 3607,
+                                "path": "token",
+                            }
+                        },
+                        {
+                            "configMap": {
+                                "name": "kube-root-ca.crt",
+                                "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                            }
+                        },
+                        {
+                            "downwardAPI": {
+                                "items": [
+                                    {
+                                        "path": "namespace",
+                                        "fieldRef": {
+                                            "apiVersion": "v1",
+                                            "fieldPath": "metadata.namespace",
+                                        },
+                                    }
+                                ]
+                            }
+                        },
+                    ],
+                },
+            },
+            {
+                "name": "projected-settings",
+                "projected": {
+                    "sources": [{"configMap": {"name": "runtime-settings"}}]
+                },
+            },
+            {
+                "name": "custom-api-token",
+                "projected": {
+                    "sources": [
+                        {
+                            "serviceAccountToken": {
+                                "audience": "agentgateway",
+                                "expirationSeconds": 600,
+                                "path": "credentials/token",
+                            }
+                        }
+                    ]
+                },
+            },
+        ]
+    )
+
+    for container in [
+        *pod["spec"]["initContainers"],
+        *pod["spec"]["containers"],
+    ]:
+        container.setdefault("volumeMounts", []).append(
+            {
+                "name": "kube-api-access-k82tq",
+                "readOnly": True,
+                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+            }
+        )
+
+    pod["spec"]["initContainers"][-1]["volumeMounts"].append(
+        {
+            "name": "projected-settings",
+            "mountPath": "/etc/runtime-settings",
+            "readOnly": True,
+        }
+    )
+    pod["spec"]["containers"][-1]["volumeMounts"].extend(
+        [
+            {
+                "name": "projected-settings",
+                "mountPath": "/etc/runtime-settings",
+                "readOnly": True,
+            },
+            {
+                "name": "custom-api-token",
+                "mountPath": "/var/run/openclaw/tokens",
+                "readOnly": True,
+            },
+        ]
+    )
+    return pod
+
+
 def apply_patch(document: dict, patch: list[dict]) -> dict:
     result = copy.deepcopy(document)
     for operation in patch:
@@ -105,14 +201,76 @@ def apply_patch(document: dict, patch: list[dict]) -> dict:
             index = len(parent) if key == "-" else int(key)
             if operation["op"] == "add":
                 parent.insert(index, operation["value"])
+            elif operation["op"] == "remove":
+                parent.pop(index)
             else:
                 parent[index] = operation["value"]
         else:
-            parent[key] = operation["value"]
+            if operation["op"] == "remove":
+                del parent[key]
+            else:
+                parent[key] = operation["value"]
     return result
 
 
 class BuildPatchTests(unittest.TestCase):
+    def test_removes_preinjected_service_account_volume_only(self) -> None:
+        pod = admitted_target_pod()
+        preserved = copy.deepcopy(pod["spec"]["volumes"][-2:])
+
+        volumes = apply_patch(pod, build_patch(pod))["spec"]["volumes"]
+
+        self.assertNotIn(
+            "kube-api-access-k82tq",
+            [volume["name"] for volume in volumes],
+        )
+        for volume in preserved:
+            self.assertIn(volume, volumes)
+
+    def test_removes_preinjected_service_account_mounts_only(self) -> None:
+        pod = admitted_target_pod()
+        service_account_mount = {
+            "name": "kube-api-access-k82tq",
+            "readOnly": True,
+            "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+        }
+        unrelated_mount = {
+            "name": "projected-settings",
+            "mountPath": "/etc/runtime-settings",
+            "readOnly": True,
+        }
+        custom_token_mount = {
+            "name": "custom-api-token",
+            "mountPath": "/var/run/openclaw/tokens",
+            "readOnly": True,
+        }
+
+        rendered = apply_patch(pod, build_patch(pod))
+        spec = rendered["spec"]
+
+        for container in [
+            *spec["initContainers"],
+            *spec["containers"],
+        ]:
+            self.assertNotIn(
+                service_account_mount,
+                container.get("volumeMounts", []),
+                container["name"],
+            )
+        rendered_prep = next(
+            container
+            for container in spec["initContainers"]
+            if container["name"] == "prepare-private-state"
+        )
+        rendered_gateway = next(
+            container
+            for container in spec["containers"]
+            if container["name"] == "gateway"
+        )
+        self.assertIn(unrelated_mount, rendered_prep["volumeMounts"])
+        self.assertIn(unrelated_mount, rendered_gateway["volumeMounts"])
+        self.assertIn(custom_token_mount, rendered_gateway["volumeMounts"])
+
     def test_rewrites_structurally_and_preserves_unrelated_mounts(self) -> None:
         pod = target_pod()
         workspace = copy.deepcopy(
