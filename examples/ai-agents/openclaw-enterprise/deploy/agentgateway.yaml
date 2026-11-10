@@ -1,5 +1,66 @@
-# agentgateway v1.7.0: an OpenAI-compatible endpoint on :4000 that accepts one
-# gateway-issued API key and calls Amazon Bedrock with the pod's own Pod Identity role.
+# agentgateway v1.7.0: an OpenAI-compatible ClusterIP HTTPS endpoint that
+# accepts one API key per tenant and uses the pod's EKS Pod Identity.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openclaw-enterprise-agw
+  labels:
+    app.kubernetes.io/name: agentgateway
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentgateway
+  namespace: openclaw-enterprise-agw
+automountServiceAccountToken: false
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: agentgateway-selfsigned
+  namespace: openclaw-enterprise-agw
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agentgateway-root
+  namespace: openclaw-enterprise-agw
+spec:
+  isCA: true
+  commonName: agentgateway-root
+  secretName: agentgateway-ca
+  issuerRef:
+    kind: Issuer
+    name: agentgateway-selfsigned
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: agentgateway-ca
+  namespace: openclaw-enterprise-agw
+spec:
+  ca:
+    secretName: agentgateway-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agentgateway-serving
+  namespace: openclaw-enterprise-agw
+spec:
+  secretName: agentgateway-tls
+  dnsNames:
+    - agentgateway.openclaw-enterprise-agw.svc
+    - agentgateway.openclaw-enterprise-agw.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: agentgateway-ca
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,17 +71,34 @@ data:
     config:
       readinessAddr: 0.0.0.0:15021
       adminAddr: "off"
+    gateways:
+      llm:
+        port: 4000
+        protocol: HTTPS
+        tls:
+          cert: /tls/tls.crt
+          key: /tls/tls.key
+          minTLSVersion: TLS_V1_2
     llm:
-      port: 4000
+      gateways:
+        - llm
       policies:
         apiKey:
           mode: strict
+          location:
+            header:
+              name: authorization
+              prefix: "Bearer "
           keys:
-            - key: ${AGW_CLIENT_KEY}
+            - keyHash: ${AGW_TENANT_A_KEY_SHA256}
+              allowedModels: ["claude-haiku"]
+            - keyHash: ${AGW_TENANT_B_KEY_SHA256}
               allowedModels: ["claude-haiku"]
       models:
         - name: claude-haiku
           provider: bedrock
+          auth:
+            aws: {}
           params:
             model: us.anthropic.claude-haiku-4-5-20251001-v1:0
             awsRegion: us-west-2
@@ -30,43 +108,174 @@ kind: Deployment
 metadata:
   name: agentgateway
   namespace: openclaw-enterprise-agw
+  labels:
+    app.kubernetes.io/name: agentgateway
 spec:
-  replicas: 1
-  selector: { matchLabels: { app: agentgateway } }
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: agentgateway
   template:
     metadata:
-      labels: { app: agentgateway }
+      labels:
+        app: agentgateway
+        app.kubernetes.io/name: agentgateway
     spec:
       serviceAccountName: agentgateway
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: agentgateway
           image: cr.agentgateway.dev/agentgateway@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
-          args: ["-f", "/config/config.yaml"]
+          imagePullPolicy: IfNotPresent
+          args:
+            - -f
+            - /config/config.yaml
           env:
             - name: AWS_REGION
               value: us-west-2
-            - name: AGW_CLIENT_KEY
-              valueFrom: { secretKeyRef: { name: agw-client-key, key: key } }
-          ports: [{ containerPort: 4000, name: llm }]
+            - name: AWS_DEFAULT_REGION
+              value: us-west-2
+            - name: AGW_TENANT_A_KEY_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: agw-client-key
+                  key: tenant-a-sha256
+                  optional: false
+            - name: AGW_TENANT_B_KEY_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: agw-client-key
+                  key: tenant-b-sha256
+                  optional: false
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agw-session-key
+                  key: key
+                  optional: false
+          ports:
+            - containerPort: 4000
+              name: https
+              protocol: TCP
+            - containerPort: 15021
+              name: health
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /healthz/ready
+              port: health
+              scheme: HTTP
+            failureThreshold: 30
+            periodSeconds: 2
           readinessProbe:
-            httpGet: { path: /healthz/ready, port: 15021 }
+            httpGet:
+              path: /healthz/ready
+              port: health
+              scheme: HTTP
+            failureThreshold: 3
             periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: https
+            failureThreshold: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
             runAsNonRoot: true
-            runAsUser: 10101
-          volumeMounts: [{ name: config, mountPath: /config }]
+            runAsUser: 65532
+            runAsGroup: 65532
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
       volumes:
         - name: config
-          configMap: { name: agentgateway-config }
+          configMap:
+            name: agentgateway-config
+        - name: tls
+          secret:
+            secretName: agentgateway-tls
+            defaultMode: 288
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentgateway
+  namespace: openclaw-enterprise-agw
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agentgateway
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: agentgateway
   namespace: openclaw-enterprise-agw
+  labels:
+    app.kubernetes.io/name: agentgateway
 spec:
   type: ClusterIP
-  selector: { app: agentgateway }
-  ports: [{ name: llm, port: 4000, targetPort: 4000 }]
+  selector:
+    app: agentgateway
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-managed-oce-workloads
+  namespace: openclaw-enterprise-agw
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agentgateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: openclaw-enterprise
+          podSelector:
+            matchExpressions:
+              - key: openclaw.dev/workload-role
+                operator: In
+                values:
+                  - agent
+                  - gateway
+      ports:
+        - protocol: TCP
+          port: 4000

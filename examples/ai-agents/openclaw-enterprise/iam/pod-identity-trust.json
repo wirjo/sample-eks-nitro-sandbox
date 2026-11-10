@@ -1,1 +1,26 @@
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"pods.eks.amazonaws.com"},"Action":["sts:AssumeRole","sts:TagSession"]}]}
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAgentGatewayPodIdentity",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "pods.eks.amazonaws.com"
+      },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "<ACCOUNT_ID>",
+          "aws:RequestTag/kubernetes-namespace": "openclaw-enterprise-agw",
+          "aws:RequestTag/kubernetes-service-account": "agentgateway"
+        },
+        "ArnEquals": {
+          "aws:SourceArn": "arn:aws:eks:<REGION>:<ACCOUNT_ID>:cluster/<CLUSTER_NAME>"
+        }
+      }
+    }
+  ]
+}

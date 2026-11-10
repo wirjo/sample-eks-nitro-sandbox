@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oce-agent-contract
+  namespace: oce-tenant-contract
+  labels:
+    openclaw.dev/workload-role: agent
+spec:
+  serviceAccountName: default
+  initContainers:
+    - name: setup-0
+      image: example.invalid/oce-runtime:test
+    - name: setup-1
+      image: example.invalid/oce-runtime:test
+    - name: setup-2
+      image: example.invalid/oce-runtime:test
+    - name: setup-3
+      image: example.invalid/oce-runtime:test
+    - name: setup-4
+      image: example.invalid/oce-runtime:test
+    - name: setup-5
+      image: example.invalid/oce-runtime:test
+    - name: setup-6
+      image: example.invalid/oce-runtime:test
+    - name: setup-7
+      image: example.invalid/oce-runtime:test
+    - name: prepare-private-state
+      image: example.invalid/oce-runtime:test
+      volumeMounts:
+        - name: runtime-state
+          mountPath: /runtime-state
+          mountPropagation: HostToContainer
+        - name: openclaw-gateway-state
+          mountPath: /gateway-state
+  containers:
+    - name: helper-0
+      image: example.invalid/oce-runtime:test
+    - name: helper-1
+      image: example.invalid/oce-runtime:test
+    - name: helper-2
+      image: example.invalid/oce-runtime:test
+      volumeMounts:
+        - name: openclaw-gateway-state
+          mountPath: /home/node/.openclaw/agents
+          subPath: agents
+    - name: helper-3
+      image: example.invalid/oce-runtime:test
+    - name: agent
+      image: example.invalid/oce-runtime:test
+      env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: agentgateway-client
+              key: key
+      volumeMounts:
+        - name: runtime-state
+          mountPath: /home/node
+          subPath: home
+          mountPropagation: HostToContainer
+        - name: workspace
+          mountPath: /workspace
+          subPathExpr: $(TENANT)/workspace
+          readOnly: true
+          recursiveReadOnly: Enabled
+        - name: openclaw-gateway-state
+          mountPath: /home/node/.openclaw/agents
+          subPath: agents
+          readOnly: true
+          recursiveReadOnly: Enabled
+        - name: openclaw-gateway-state
+          mountPath: /home/node/.openclaw/sessions
+          subPath: sessions
+  volumes:
+    - name: runtime-state
+      emptyDir: {}
+    - name: workspace
+      emptyDir: {}
+    - name: openclaw-gateway-state
+      persistentVolumeClaim:
+        claimName: oce-agent-state

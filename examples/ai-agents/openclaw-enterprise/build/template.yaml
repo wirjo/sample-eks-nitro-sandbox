@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Build the OpenClaw Enterprise sample images from source in CodeBuild.
+
+Parameters:
+  SampleRepositoryUrl:
+    Type: String
+    Default: https://github.com/aws-samples/sample-eks-nitro-sandbox.git
+    AllowedPattern: ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$
+    Description: Public Git repository containing this sample.
+  SampleGitRevision:
+    Type: String
+    AllowedPattern: ^[0-9a-f]{40}$
+    ConstraintDescription: Use the full 40-character lowercase Git commit SHA.
+    Description: Exact sample commit to build the admission adapter from.
+  OceRepositoryUrl:
+    Type: String
+    Default: https://github.com/openclaw/openclaw-enterprise.git
+    AllowedPattern: ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$
+    Description: Public OpenClaw Enterprise source repository.
+  OceGitRevision:
+    Type: String
+    Default: c6541831756ae40d0485d16d8f0ffeab9851372d
+    AllowedPattern: ^[0-9a-f]{40}$
+    ConstraintDescription: Use the full 40-character lowercase Git commit SHA.
+    Description: Exact OpenClaw Enterprise commit for controller and runtime images.
+  RepositoryPrefix:
+    Type: String
+    Default: openclaw-enterprise
+    AllowedPattern: ^[a-z0-9]+(?:[._/-][a-z0-9]+)*$
+    Description: Prefix for the three ECR repository names.
+  TargetPlatform:
+    Type: String
+    Default: linux/amd64
+    AllowedValues:
+      - linux/amd64
+      - linux/arm64
+
+Resources:
+  ImageEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the OpenClaw Enterprise sample ECR repositories.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+      Tags:
+        - Key: ManagedBy
+          Value: openclaw-enterprise-sample
+
+  AdapterRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${RepositoryPrefix}/adapter
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt ImageEncryptionKey.Arn
+      Tags:
+        - Key: ManagedBy
+          Value: openclaw-enterprise-sample
+
+  ControllerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${RepositoryPrefix}/controller
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt ImageEncryptionKey.Arn
+      Tags:
+        - Key: ManagedBy
+          Value: openclaw-enterprise-sample
+
+  RuntimeRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${RepositoryPrefix}/runtime
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey: !GetAtt ImageEncryptionKey.Arn
+      Tags:
+        - Key: ManagedBy
+          Value: openclaw-enterprise-sample
+
+  ImageBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildAndPushSampleImages
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/openclaw-enterprise-images
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/openclaw-enterprise-images:*
+              - Sid: GetEcrAuthorizationToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushAndVerifyImages
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource:
+                  - !GetAtt AdapterRepository.Arn
+                  - !GetAtt ControllerRepository.Arn
+                  - !GetAtt RuntimeRepository.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: openclaw-enterprise-images
+      Description: Builds the sample adapter and pinned OCE images from source.
+      ServiceRole: !GetAtt ImageBuildRole.Arn
+      QueuedTimeoutInMinutes: 60
+      TimeoutInMinutes: 120
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+            exported-variables:
+              - ADAPTER_IMAGE
+              - CONTROLLER_IMAGE
+              - RUNTIME_IMAGE
+              - SAMPLE_SOURCE_REVISION
+              - OCE_SOURCE_REVISION
+          phases:
+            build:
+              commands:
+                - set -euo pipefail
+                - export SAMPLE_SOURCE_DIR="$CODEBUILD_SRC_DIR/sample-source"
+                - git init "$SAMPLE_SOURCE_DIR"
+                - git -C "$SAMPLE_SOURCE_DIR" remote add origin "$SAMPLE_REPOSITORY_URL"
+                - git -C "$SAMPLE_SOURCE_DIR" fetch --depth 1 origin "$SAMPLE_GIT_REVISION"
+                - test "$(git -C "$SAMPLE_SOURCE_DIR" rev-parse FETCH_HEAD)" = "$SAMPLE_GIT_REVISION"
+                - git -C "$SAMPLE_SOURCE_DIR" checkout --detach "$SAMPLE_GIT_REVISION"
+                - export BUILD_OUTPUT_ENV="$CODEBUILD_SRC_DIR/image-build.env"
+                - "$SAMPLE_SOURCE_DIR/examples/ai-agents/openclaw-enterprise/build/build-images.sh"
+                - source "$BUILD_OUTPUT_ENV"
+                - cat "$CODEBUILD_SRC_DIR/image-digests.json"
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          - Name: SAMPLE_REPOSITORY_URL
+            Type: PLAINTEXT
+            Value: !Ref SampleRepositoryUrl
+          - Name: SAMPLE_GIT_REVISION
+            Type: PLAINTEXT
+            Value: !Ref SampleGitRevision
+          - Name: OCE_REPOSITORY_URL
+            Type: PLAINTEXT
+            Value: !Ref OceRepositoryUrl
+          - Name: OCE_GIT_REVISION
+            Type: PLAINTEXT
+            Value: !Ref OceGitRevision
+          - Name: ADAPTER_REPOSITORY
+            Type: PLAINTEXT
+            Value: !Ref AdapterRepository
+          - Name: CONTROLLER_REPOSITORY
+            Type: PLAINTEXT
+            Value: !Ref ControllerRepository
+          - Name: RUNTIME_REPOSITORY
+            Type: PLAINTEXT
+            Value: !Ref RuntimeRepository
+          - Name: TARGET_PLATFORM
+            Type: PLAINTEXT
+            Value: !Ref TargetPlatform
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: /aws/codebuild/openclaw-enterprise-images
+          StreamName: images
+
+Outputs:
+  ProjectName:
+    Value: !Ref ImageBuildProject
+  AdapterRepositoryUri:
+    Value: !GetAtt AdapterRepository.RepositoryUri
+  ControllerRepositoryUri:
+    Value: !GetAtt ControllerRepository.RepositoryUri
+  RuntimeRepositoryUri:
+    Value: !GetAtt RuntimeRepository.RepositoryUri
+  OceGitRevision:
+    Value: !Ref OceGitRevision
