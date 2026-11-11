@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly SCRIPT_DIR
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-readonly SAMPLE_DIR
+readonly SCRIPT_DIR
 SAMPLE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+readonly SAMPLE_DIR
 readonly AGW_NAMESPACE="openclaw-enterprise-agw"
 readonly TENANT_TEMPLATE="${SAMPLE_DIR}/deploy/tenant-model-gateway.yaml.tpl"
 

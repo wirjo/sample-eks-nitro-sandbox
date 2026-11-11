@@ -6,6 +6,7 @@ import unittest
 
 from adapter import (
     AGW_CA_PATH,
+    AGW_CA_MOUNT_PATH,
     AGW_CA_VOLUME,
     AdmissionError,
     LINK_INIT_NAME,
@@ -300,8 +301,7 @@ class BuildPatchTests(unittest.TestCase):
         self.assertIn(
             {
                 "name": AGW_CA_VOLUME,
-                "mountPath": AGW_CA_PATH,
-                "subPath": "ca.crt",
+                "mountPath": AGW_CA_MOUNT_PATH,
                 "readOnly": True,
             },
             gateway_mounts,

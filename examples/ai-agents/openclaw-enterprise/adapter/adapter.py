@@ -17,7 +17,8 @@ HOME_ROOT = "/home/node/"
 LINK_INIT_NAME = "nitro-link-gateway-state"
 AGW_CA_VOLUME = "agentgateway-ca"
 AGW_CA_CONFIG_MAP = "agentgateway-ca"
-AGW_CA_PATH = "/etc/openclaw/agentgateway/ca.crt"
+AGW_CA_MOUNT_PATH = "/etc/agentgateway-ca"
+AGW_CA_PATH = f"{AGW_CA_MOUNT_PATH}/ca.crt"
 NODE_CA_ENV = "NODE_EXTRA_CA_CERTS"
 SERVICE_ACCOUNT_MOUNT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 
@@ -368,7 +369,7 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                 if group_name == "containers":
                     if any(
                         mount.get("name") == AGW_CA_VOLUME
-                        or mount.get("mountPath") == AGW_CA_PATH
+                        or mount.get("mountPath") == AGW_CA_MOUNT_PATH
                         for mount in rewritten
                     ):
                         raise AdmissionError(
@@ -377,8 +378,7 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                     rewritten.append(
                         {
                             "name": AGW_CA_VOLUME,
-                            "mountPath": AGW_CA_PATH,
-                            "subPath": "ca.crt",
+                            "mountPath": AGW_CA_MOUNT_PATH,
                             "readOnly": True,
                         }
                     )
