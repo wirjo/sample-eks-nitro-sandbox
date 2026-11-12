@@ -20,12 +20,17 @@ AGW_CA_CONFIG_MAP = "agentgateway-ca"
 AGW_CA_MOUNT_PATH = "/etc/agentgateway-ca"
 AGW_CA_PATH = f"{AGW_CA_MOUNT_PATH}/ca.crt"
 NODE_CA_ENV = "NODE_EXTRA_CA_CERTS"
+TMPDIR_ENV = "TMPDIR"
+TMPDIR_PATH = "/home/node/.openclaw/tmp"
 SERVICE_ACCOUNT_MOUNT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 LINK_SCRIPT = r"""
 const fs = require("node:fs");
 const path = require("node:path");
 const links = JSON.parse(process.env.OCE_STATE_LINKS || "[]");
+const temporary = "/runtime-state/home/.openclaw/tmp";
+fs.mkdirSync(temporary, {recursive: true, mode: 0o700});
+fs.chmodSync(temporary, 0o700);
 for (const item of links) {
   const link = path.posix.join("/runtime-state/home", item.link);
   const target = path.posix.join("/gateway-state", item.target);
@@ -97,15 +102,20 @@ def _runtime_environment(container: dict[str, Any], location: str) -> list[Any]:
     environment = container.get("env", [])
     if not isinstance(environment, list):
         raise AdmissionError(f"{location}.env must be a list")
-    matches = [
-        entry
-        for entry in environment
-        if isinstance(entry, dict) and entry.get("name") == NODE_CA_ENV
-    ]
-    if len(matches) > 1:
-        raise AdmissionError(f"{location} has duplicate {NODE_CA_ENV} entries")
-    if matches and matches[0] != {"name": NODE_CA_ENV, "value": AGW_CA_PATH}:
-        raise AdmissionError(f"{location} already configures {NODE_CA_ENV}")
+    required = {
+        NODE_CA_ENV: AGW_CA_PATH,
+        TMPDIR_ENV: TMPDIR_PATH,
+    }
+    for name, value in required.items():
+        matches = [
+            entry
+            for entry in environment
+            if isinstance(entry, dict) and entry.get("name") == name
+        ]
+        if len(matches) > 1:
+            raise AdmissionError(f"{location} has duplicate {name} entries")
+        if matches and matches[0] != {"name": name, "value": value}:
+            raise AdmissionError(f"{location} already configures {name}")
     return environment
 
 
@@ -385,11 +395,20 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                     environment = _runtime_environment(
                         container, f"spec.{group_name}[{index}]"
                     )
-                    if not any(
-                        isinstance(entry, dict)
-                        and entry.get("name") == NODE_CA_ENV
-                        for entry in environment
-                    ):
+                    required_environment = [
+                        {"name": NODE_CA_ENV, "value": AGW_CA_PATH},
+                        {"name": TMPDIR_ENV, "value": TMPDIR_PATH},
+                    ]
+                    missing_environment = [
+                        entry
+                        for entry in required_environment
+                        if not any(
+                            isinstance(current, dict)
+                            and current.get("name") == entry["name"]
+                            for current in environment
+                        )
+                    ]
+                    if missing_environment:
                         environment_patches.append(
                             {
                                 "op": "add"
@@ -398,7 +417,7 @@ def build_patch(pod: dict[str, Any]) -> list[dict[str, Any]]:
                                 "path": f"/spec/{group_name}/{index}/env",
                                 "value": [
                                     *copy.deepcopy(environment),
-                                    {"name": NODE_CA_ENV, "value": AGW_CA_PATH},
+                                    *missing_environment,
                                 ],
                             }
                         )

@@ -11,6 +11,8 @@ from adapter import (
     AdmissionError,
     LINK_INIT_NAME,
     NODE_CA_ENV,
+    TMPDIR_ENV,
+    TMPDIR_PATH,
     build_patch,
 )
 
@@ -215,6 +217,43 @@ def apply_patch(document: dict, patch: list[dict]) -> dict:
 
 
 class BuildPatchTests(unittest.TestCase):
+    def test_configures_private_runtime_tmp_directory(self) -> None:
+        rendered = apply_patch(target_pod(), build_patch(target_pod()))
+        gateway = next(
+            container
+            for container in rendered["spec"]["containers"]
+            if container["name"] == "gateway"
+        )
+        self.assertIn(
+            {"name": TMPDIR_ENV, "value": TMPDIR_PATH},
+            gateway["env"],
+        )
+
+    def test_prepares_private_runtime_tmp_with_owner_only_permissions(self) -> None:
+        rendered = apply_patch(target_pod(), build_patch(target_pod()))
+        preparer = next(
+            container
+            for container in rendered["spec"]["initContainers"]
+            if container["name"] == LINK_INIT_NAME
+        )
+        startup = " ".join(
+            [
+                *preparer.get("command", []),
+                *preparer.get("args", []),
+            ]
+        )
+        self.assertIn("/runtime-state/home/.openclaw/tmp", startup)
+        self.assertIn("0o700", startup)
+        self.assertEqual(
+            preparer.get("securityContext"),
+            {
+                "allowPrivilegeEscalation": False,
+                "readOnlyRootFilesystem": True,
+                "runAsNonRoot": True,
+                "capabilities": {"drop": ["ALL"]},
+            },
+        )
+
     def test_removes_preinjected_service_account_volume_only(self) -> None:
         pod = admitted_target_pod()
         preserved = copy.deepcopy(pod["spec"]["volumes"][-2:])
